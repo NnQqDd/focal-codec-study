@@ -1,0 +1,6 @@
+torch
+torchaudio
+numpy
+pandas
+matplotlib
+focalcodec @ git+https://github.com/lucadellalib/focalcodec.git@main
