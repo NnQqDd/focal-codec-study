@@ -3,4 +3,7 @@ torchaudio
 numpy
 pandas
 matplotlib
+scikit-learn
+pyyaml
+bcubed
 focalcodec @ git+https://github.com/lucadellalib/focalcodec.git@main

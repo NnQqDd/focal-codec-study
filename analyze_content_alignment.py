@@ -15,6 +15,8 @@ first layer, ``in_proj``, is Linear(13, 256) and is applied to each code
 on its own, before any focal block mixes neighboring frames. That 256-D
 vector is the embedding this script compares. Later decompressor layers
 are left unused because they pool temporal context into the frame.
+Loading that embedding is ``focalcodec_embed``, shared with
+``analize_speaker.py``.
 
 Each pair is resampled to 16 kHz and forced to one length, then trimmed
 to a whole number of codec hops. ``--align crop`` (default) keeps the
@@ -51,17 +53,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
 from matplotlib.collections import LineCollection
 from tqdm import tqdm
+
+from focalcodec_embed import (
+    CHECKPOINT,
+    EMBED_DIM,
+    embed_waveform,
+    load_codec,
+    load_mono,
+    pick_column,
+    resolve_audio,
+)
 
 
 log = logging.getLogger("focalcodec-alignment")
 
-CHECKPOINT = "lucadellalib/focalcodec_50hz"
-EMBED_DIM = 256
 # Fixed color scale of Figure 5: cosine from 0 (blue / purple) to 1 (yellow).
 VMIN = 0.0
 VMAX = 1.0
@@ -136,27 +144,6 @@ def parse_args():
     return p.parse_args()
 
 
-def pick_column(columns, names):
-    lookup = {str(c).strip().lower(): c for c in columns}
-    for name in names:
-        hit = lookup.get(name.lower())
-        if hit is not None:
-            return hit
-    return None
-
-
-def resolve_audio(value, meta_dir):
-    """Absolute cells are full paths. Relative cells hang off ``meta_dir`` only."""
-    raw = "" if pd.isna(value) else str(value).strip()
-    if raw.lower() in {"", "nan", "none"}:
-        raise SystemExit("empty audio path")
-    given = Path(raw).expanduser()
-    path = given if given.is_absolute() else meta_dir / given
-    if not path.is_file():
-        raise SystemExit(f"audio not found: {path}")
-    return path.resolve()
-
-
 def load_pairs(metadata_path, limit):
     path = Path(metadata_path).expanduser().resolve()
     if not path.is_file():
@@ -186,19 +173,6 @@ def load_pairs(metadata_path, limit):
     return pairs, src_col, out_col
 
 
-def load_mono(path, sample_rate):
-    wav, sr = torchaudio.load(path)
-    if wav.shape[0] > 1:
-        wav = wav.mean(dim=0, keepdim=True)
-    wav = wav[:1]
-    if sr != sample_rate:
-        wav = torchaudio.functional.resample(wav, sr, sample_rate)
-    wav = wav.squeeze(0).contiguous()
-    if wav.numel() == 0:
-        raise SystemExit(f"{path} is empty after resampling to {sample_rate} Hz")
-    return wav
-
-
 def match_length(source, output, policy, hop):
     """Return two equal-length waveforms on the codec hop grid.
 
@@ -225,49 +199,6 @@ def match_length(source, output, policy, hop):
             f"(hop={hop} samples)"
         )
     return source[:n].contiguous(), output[:n].contiguous()
-
-
-def load_codec(checkpoint, device):
-    import focalcodec
-
-    codec = focalcodec.FocalCodec.from_pretrained(checkpoint)
-    codec.eval()
-    for param in codec.parameters():
-        param.requires_grad_(False)
-    codec.to(device)
-
-    proj = codec.decompressor.in_proj
-    code_dim = int(codec.quantizer.dim)
-    if not isinstance(proj, nn.Linear) or proj.in_features != code_dim or proj.out_features != EMBED_DIM:
-        raise SystemExit(
-            "decompressor.in_proj is "
-            f"Linear({getattr(proj, 'in_features', '?')}, {getattr(proj, 'out_features', '?')}). "
-            f"FocalCodec 50 Hz maps each {code_dim}-D code through Linear({code_dim}, {EMBED_DIM}) "
-            "before any temporal layer. Refusing a different projection."
-        )
-    hop = int(codec.encoder.downsample_factor)
-    sample_rate = int(codec.sample_rate_input)
-    rate = sample_rate / hop
-    if abs(rate - 50.0) > 0.1:
-        log.warning("token rate is %.3f Hz; this script expects the 50 Hz checkpoint", rate)
-    return codec, proj, hop, sample_rate
-
-
-@torch.inference_mode()
-def embed_waveform(codec, proj, wav, device):
-    """13-D code, discrete token, and the independent 256-D lift of each frame."""
-    sig = wav.to(device).unsqueeze(0)
-    codes = codec.sig_to_codes(sig)
-    emb = proj(codes)
-    toks = codec.codes_to_toks(codes)
-    emb = emb.squeeze(0).float()
-    codes = codes.squeeze(0).float()
-    toks = toks.squeeze(0).long()
-    if emb.ndim != 2 or emb.shape[-1] != EMBED_DIM:
-        raise RuntimeError(f"expected (frames, {EMBED_DIM}) embeddings, got {tuple(emb.shape)}")
-    if not torch.isfinite(emb).all():
-        raise RuntimeError("non-finite token embedding")
-    return emb, codes, toks
 
 
 def pearson(x, y):

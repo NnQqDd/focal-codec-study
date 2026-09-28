@@ -1,0 +1,14 @@
+# K-means for mean-pooled FocalCodec 256-D utterance embeddings.
+# The cluster count is the number of speakers in the metadata, not a key here.
+
+kmeans:
+  # L2-normalize each averaged embedding so magnitude does not dominate.
+  # On the unit sphere, Euclidean distance is monotone with cosine distance.
+  normalize: true
+  n_init: 10
+  max_iter: 300
+  tol: 0.0001
+  algorithm: lloyd
+  random_state: 0
+  # Passed to silhouette_score. K-means itself is always Euclidean.
+  silhouette_metric: euclidean

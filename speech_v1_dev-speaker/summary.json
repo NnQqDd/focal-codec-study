@@ -1,0 +1,30 @@
+{
+  "checkpoint": "lucadellalib/focalcodec_50hz",
+  "representation": "mean of decompressor.in_proj",
+  "representation_detail": "Each frame is a 13-D binary-spherical code lifted by Linear(13, 256) on its own. Focal blocks are not used. The utterance vector is the mean of those 256-D frames.",
+  "embed_dim": 256,
+  "metadata": "/home/duyn/ActableDuy/masked-diffusion-audio-model/metadatas/speech_v1_dev.csv",
+  "normalize": true,
+  "kmeans": {
+    "normalize": true,
+    "n_init": 10,
+    "max_iter": 300,
+    "tol": 0.0001,
+    "algorithm": "lloyd",
+    "random_state": 0,
+    "silhouette_metric": "euclidean"
+  },
+  "n_utterances": 3787,
+  "n_speakers": 38,
+  "n_clusters": 38,
+  "silhouette": 0.100999,
+  "bcubed_precision": 0.457472,
+  "bcubed_recall": 0.416105,
+  "bcubed_f1": 0.435809,
+  "bcubed_recall_shuffled": 0.037792,
+  "bcubed_f1_shuffled": 0.040334,
+  "n_shuffles": 32,
+  "cluster_size_min": 63,
+  "cluster_size_max": 171,
+  "reading": "Across 3787 utterances and 38 speakers, silhouette is 0.101. B-cubed precision is 0.457, recall is 0.416, and F1 is 0.436, against a speaker-shuffle recall of 0.038 and F1 of 0.040. A silhouette near 1 and a B-cubed F1 well above the shuffle mean the averaged 256-D vector separates these speakers. A silhouette near 0 and an F1 near the shuffle mean the average does not carry speaker identity."
+}
