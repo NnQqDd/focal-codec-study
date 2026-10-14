@@ -20,8 +20,7 @@ the speaker component this measurement is trying to see.
 The null for "this is content" is a time shuffle of one side. A shuffle
 keeps the token multiset of the utterance and destroys the alignment.
 Speaker identity is constant across frames, so it survives the shuffle.
-Content does not. The gap between the aligned diagonal and the shuffled
-diagonal is the quantity to read.
+Content does not.
 
     python analyze_content.py --pairs pairs.csv \
         --embeddings embeddings/focalcodec50.npy \
@@ -67,14 +66,7 @@ OUTPUT_COLUMNS = ("output", "output_file", "output_path")
 
 METRIC_KEYS = (
     "diagonal_cosine",
-    "off_diagonal_cosine",
-    "diagonal_margin",
     "shuffled_diagonal_cosine",
-    "content_gap",
-    "token_match_rate",
-    "token_match_shuffled",
-    "source_self_offdiag",
-    "output_self_offdiag",
 )
 
 
@@ -96,7 +88,7 @@ def parse_args():
     p.add_argument("--max-figures", type=int, default=-1,
                    help="Pair figures to write, in CSV order. -1 writes every pair")
     p.add_argument("--n-shuffles", type=int, default=32,
-                   help="Time-shuffle draws for the content-gap null")
+                   help="Time-shuffle draws for the shuffled-cosine null")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--limit", type=int, default=0,
                    help="Analyze only the first N pairs (0 = all)")
@@ -247,22 +239,6 @@ def unit_rows(x):
     return x / norms.clamp_min(1e-12)
 
 
-def off_diagonal_mean(left, right):
-    """Mean cosine over i != j. Rows of ``left`` and ``right`` are L2-normalized."""
-    t = left.shape[0]
-    total = torch.dot(left.sum(dim=0), right.sum(dim=0))
-    diag = (left * right).sum()
-    return (total - diag) / (t * (t - 1))
-
-
-def self_off_diagonal(feats):
-    """Mean cosine over i != j. A zero row has self-cosine 0, so subtract the real diagonal."""
-    t = feats.shape[0]
-    total = torch.dot(feats.sum(dim=0), feats.sum(dim=0))
-    diag = (feats * feats).sum()
-    return (total - diag) / (t * (t - 1))
-
-
 def shuffled_diagonal(left, right, n_shuffles, generator):
     """Mean diagonal cosine after permuting ``right``. Rows are normalized."""
     t = left.shape[0]
@@ -273,47 +249,25 @@ def shuffled_diagonal(left, right, n_shuffles, generator):
     return acc / n_shuffles
 
 
-def shuffled_token_match(source_toks, output_toks, n_shuffles, generator):
-    t = source_toks.shape[0]
-    source_toks = source_toks.cpu()
-    output_toks = output_toks.cpu()
-    acc = 0.0
-    for _ in range(n_shuffles):
-        perm = torch.randperm(t, generator=generator)
-        acc += float((source_toks == output_toks[perm]).float().mean())
-    return acc / n_shuffles
-
-
 def measure_pair(emb_s, emb_o, tok_s, tok_o, n_shuffles, seed):
     if emb_s.shape[0] != emb_o.shape[0]:
         raise RuntimeError(
             f"frame counts differ after length matching ({emb_s.shape[0]} vs {emb_o.shape[0]})"
         )
     t = emb_s.shape[0]
-    if t < 2:
-        raise SystemExit("need at least two frames to measure off-diagonal cosine")
+    if t < 1:
+        raise SystemExit("need at least one frame")
 
     src = unit_rows(emb_s)
     out = unit_rows(emb_o)
-    diag = (src * out).sum(dim=-1)
-    diagonal = float(diag.mean())
-    off = float(off_diagonal_mean(src, out))
+    diagonal = float((src * out).sum(dim=-1).mean())
     generator = torch.Generator(device="cpu")
     generator.manual_seed(int(seed))
     shuffled = float(shuffled_diagonal(src, out, n_shuffles, generator))
-    token_match = float((tok_s == tok_o).float().mean())
-    token_shuf = shuffled_token_match(tok_s, tok_o, n_shuffles, generator)
     return {
         "n_frames": int(t),
         "diagonal_cosine": diagonal,
-        "off_diagonal_cosine": off,
-        "diagonal_margin": diagonal - off,
         "shuffled_diagonal_cosine": shuffled,
-        "content_gap": diagonal - shuffled,
-        "token_match_rate": token_match,
-        "token_match_shuffled": token_shuf,
-        "source_self_offdiag": float(self_off_diagonal(src)),
-        "output_self_offdiag": float(self_off_diagonal(out)),
         "source_n_unique_tokens": int(tok_s[tok_s >= 0].unique().numel()),
         "output_n_unique_tokens": int(tok_o[tok_o >= 0].unique().numel()),
         "_src": src.detach(),
@@ -380,11 +334,9 @@ def save_pair_figure(pair, metrics, path):
 
     fig.text(
         0.5, 0.005,
-        "diagonal {d}    shuffle {s}    gap {g}    token match {m}".format(
+        "diagonal {d}    shuffle {s}".format(
             d=_shown("diagonal_cosine"),
             s=_shown("shuffled_diagonal_cosine"),
-            g=_shown("content_gap"),
-            m=_shown("token_match_rate", percent=True),
         ),
         ha="center", va="bottom", fontsize=8, color="0.25",
     )
@@ -416,15 +368,6 @@ def _fmt(value):
     return f"{value:.3f}"
 
 
-def _fmt_pct(value):
-    if value is None:
-        return "n/a"
-    pct = 100.0 * float(value)
-    if pct != 0.0 and abs(pct) < 0.05:
-        return f"{pct:.3f}%"
-    return f"{pct:.1f}%"
-
-
 def summarize(rows, args, table, src_col, tgt_col, out_col):
     means = {key: _round(_finite_mean(r[key] for r in rows)) for key in METRIC_KEYS}
     stds = {}
@@ -432,7 +375,6 @@ def summarize(rows, args, table, src_col, tgt_col, out_col):
         arr = np.array([r[key] for r in rows], dtype=np.float64)
         stds[key] = _round(float(np.nanstd(arr))) if np.isfinite(arr).any() else None
     codebook_size = int(table.shape[0])
-    means["token_match_chance_uniform"] = _round(1.0 / float(codebook_size))
     return {
         "embeddings": str(Path(args.embeddings).expanduser().resolve()),
         "pairs": str(Path(args.pairs).expanduser().resolve()),
@@ -462,20 +404,10 @@ def print_summary(summary):
           f"align={summary['align']}  ·  {summary['representation']}")
     lines = (
         ("aligned cosine", "diagonal_cosine"),
-        ("off-diagonal cosine", "off_diagonal_cosine"),
         ("shuffled cosine", "shuffled_diagonal_cosine"),
-        ("content gap", "content_gap"),
-        ("token match", "token_match_rate"),
-        ("token match, shuffled", "token_match_shuffled"),
-        ("within-utterance off-diag (source)", "source_self_offdiag"),
     )
     for label, key in lines:
-        value = mean[key]
-        if key in {"token_match_rate", "token_match_shuffled"}:
-            shown = _fmt_pct(value)
-        else:
-            shown = _fmt(value)
-        print(f"  {label:<36} {shown}")
+        print(f"  {label:<36} {_fmt(mean[key])}")
 
 
 def drop_private(row):

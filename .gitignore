@@ -5,3 +5,4 @@ __pycache__/
 embeddings/
 tokens/
 results/
+RESULTS.md
