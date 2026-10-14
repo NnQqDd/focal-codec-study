@@ -1,21 +1,23 @@
-"""Speaker clustering of mean-pooled FocalCodec 50 Hz embeddings.
+"""Speaker clustering of mean-pooled FocalCodec token embeddings.
 
-Each utterance is tokenized with FocalCodec 50 Hz, lifted to 256-D by
-``decompressor.in_proj`` (one code at a time, no focal block), and averaged
-over time. K-means is fit with one cluster per speaker in the metadata.
-Silhouette measures whether those averages form speaker-shaped groups.
-B-cubed precision, recall, and F1 measure agreement with the speaker
-labels. The F1 is the B-cubed result. A speaker shuffle is the null: it
-keeps the speaker sizes and destroys the link to the clusters.
+``--metadata`` is a CSV with a ``filepath`` column and a ``speaker``
+column. Each filepath is a ``.txt`` of token ids, as written by
+``focalcodec50_tokenize_metadata.py``. Each id selects a row of
+``--embeddings``. The utterance vector is the mean of those rows.
+K-means is fit with one cluster per speaker. Silhouette measures
+whether those averages form speaker-shaped groups. B-cubed precision,
+recall, and F1 measure agreement with the speaker labels. The F1 is
+the B-cubed result.
 
-    python analize_speaker.py \
-        --metadata-dir /path/to/metadatas_or_one.csv \
-        --cluster-config cluster.yaml
+    python analyze_speaker.py \
+        --metadata tokens/test.csv \
+        --embeddings embeddings/focalcodec50.npy \
+        --result-dir speaker-clustering
 
-A directory is every ``*.csv`` sitting directly in it. A csv path is that
-one file. Each file needs a path column (``path`` or ``filepath``) and a
-``speaker`` column, as in ``speech_v1_dev.csv``. Files without those
-columns are skipped when the argument is a directory.
+An absolute filepath is used as given. A relative one is resolved against
+the CSV's directory. When the CSV has a ``duration`` column, that value
+is the seconds written to the assignment table. Otherwise seconds are the
+token count divided by 50.
 """
 
 import argparse
@@ -26,7 +28,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
 import yaml
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
@@ -34,23 +35,13 @@ from tqdm import tqdm
 
 import bcubed
 
-from focalcodec_embed import (
-    CHECKPOINT,
-    EMBED_DIM,
-    average_embedding,
-    embed_waveform,
-    load_codec,
-    load_mono,
-    pick_column,
-    resolve_audio,
-)
-
 
 log = logging.getLogger("focalcodec-speaker")
 
-PATH_COLUMNS = ("path", "filepath")
+PATH_COLUMNS = ("filepath", "path")
 SPEAKER_COLUMNS = ("speaker",)
-N_SHUFFLES = 32
+DURATION_COLUMNS = ("duration",)
+FRAME_HZ = 50.0
 
 # n_clusters is the speaker count, so it is not a config key.
 DEFAULTS = {
@@ -70,24 +61,19 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Cluster mean-pooled FocalCodec 50 Hz embeddings by speaker."
     )
-    p.add_argument(
-        "--metadata-dir", required=True,
-        help="Directory of metadata CSVs, or one CSV. Columns: path (or "
-             "filepath) and speaker",
-    )
+    p.add_argument("--metadata", required=True,
+                   help="CSV with a filepath column of .txt token files and a speaker column")
+    p.add_argument("--embeddings", required=True,
+                   help="Numpy array of shape (vocab, dim), one row per token id")
     p.add_argument(
         "--cluster-config",
         default=str(Path(__file__).with_name("cluster.yaml")),
         help="YAML with a kmeans key (default: cluster.yaml beside this script)",
     )
-    p.add_argument("--save-dir", default=None,
-                   help="Output directory (default: ./speaker-clustering). "
-                        "A directory of CSVs writes one subdirectory per file")
-    p.add_argument("--checkpoint", default=CHECKPOINT,
-                   help=f"FocalCodec checkpoint (default: {CHECKPOINT})")
+    p.add_argument("--result-dir", required=True,
+                   help="Directory for assignments.csv and summary.json")
     p.add_argument("--limit", type=int, default=0,
-                   help="Embed only the first N rows of each CSV (0 = all)")
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+                   help="Embed only the first N rows (0 = all)")
     return p.parse_args()
 
 
@@ -172,21 +158,61 @@ def _validate_config(cfg):
         raise SystemExit("kmeans.silhouette_metric is empty")
 
 
-def metadata_files(metadata_dir):
-    path = Path(metadata_dir).expanduser().resolve()
-    if path.is_file():
-        if path.suffix.lower() != ".csv":
-            raise SystemExit(f"metadata is not a csv: {path}")
-        return [path], False
-    if not path.is_dir():
-        raise SystemExit(f"metadata not found: {path}")
-    files = sorted(
-        child for child in path.iterdir()
-        if child.is_file() and child.suffix.lower() == ".csv"
-    )
-    if not files:
-        raise SystemExit(f"no csv files in {path}")
-    return files, True
+def pick_column(columns, names):
+    lookup = {str(c).strip().lower(): c for c in columns}
+    for name in names:
+        hit = lookup.get(name.lower())
+        if hit is not None:
+            return hit
+    return None
+
+
+def resolve_token(value, meta_dir):
+    """Absolute cells are full paths. Relative cells hang off the CSV directory."""
+    raw = "" if pd.isna(value) else str(value).strip()
+    if raw.lower() in {"", "nan", "none"}:
+        raise SystemExit("empty filepath")
+    given = Path(raw).expanduser()
+    path = given if given.is_absolute() else meta_dir / given
+    path = path.resolve()
+    if not path.is_file():
+        raise SystemExit(f"token file not found: {path}")
+    return path
+
+
+def load_embedding_table(path):
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise SystemExit(f"embeddings not found: {path}")
+    try:
+        table = np.load(path, allow_pickle=False)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot read embeddings {path}: {exc}") from exc
+    if not isinstance(table, np.ndarray) or table.ndim != 2:
+        raise SystemExit(f"{path} must be a 2-D array, got shape {getattr(table, 'shape', None)}")
+    if table.shape[0] < 1 or table.shape[1] < 1:
+        raise SystemExit(f"{path} is empty")
+    table = np.asarray(table, dtype=np.float32)
+    if not np.isfinite(table).all():
+        raise SystemExit(f"{path} has non-finite values")
+    return table
+
+
+def read_tokens(path, vocab):
+    """One whitespace-separated sequence of token ids."""
+    text = Path(path).read_text(encoding="utf-8")
+    parts = text.split()
+    if not parts:
+        raise SystemExit(f"{path} has no token ids")
+    try:
+        ids = np.array([int(part) for part in parts], dtype=np.int64)
+    except ValueError as exc:
+        raise SystemExit(f"{path} has a non-integer token: {exc}") from exc
+    low = int(ids.min())
+    high = int(ids.max())
+    if low < 0 or high >= vocab:
+        raise SystemExit(f"{path} has a token id outside [0, {vocab})")
+    return ids
 
 
 def speaker_label(value):
@@ -201,24 +227,35 @@ def speaker_label(value):
 
 
 def load_rows(path, limit):
-    """Rows of one metadata CSV, or None when the columns are absent."""
+    """Rows of one metadata CSV."""
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise SystemExit(f"metadata not found: {path}")
     df = pd.read_csv(path)
+    if df.empty:
+        raise SystemExit(f"{path} has no rows")
     path_col = pick_column(df.columns, PATH_COLUMNS)
     spk_col = pick_column(df.columns, SPEAKER_COLUMNS)
     if path_col is None or spk_col is None:
-        return None
+        raise SystemExit(
+            f"{path} has columns {list(df.columns)}. Need one of "
+            f"{list(PATH_COLUMNS)} and one of {list(SPEAKER_COLUMNS)}"
+        )
+    duration_col = pick_column(df.columns, DURATION_COLUMNS)
     if limit and limit > 0:
         df = df.iloc[:limit]
-    if df.empty:
-        raise SystemExit(f"{path} has no rows")
     rows = []
     for index, record in df.iterrows():
         speaker = record[spk_col]
         if pd.isna(speaker) or str(speaker).strip().lower() in {"", "nan", "none"}:
             raise SystemExit(f"{path} row {index} has an empty speaker")
+        seconds = None
+        if duration_col is not None and not pd.isna(record[duration_col]):
+            seconds = float(record[duration_col])
         rows.append({
-            "path": str(resolve_audio(record[path_col], path.parent)),
+            "path": str(resolve_token(record[path_col], path.parent)),
             "speaker": speaker_label(speaker),
+            "seconds": seconds,
         })
     return rows
 
@@ -239,8 +276,7 @@ def bcubed_hard(speakers, clusters):
     """B-cubed precision, recall, and F1 for one label and one cluster per item.
 
     This is the same quantity as ``bcubed.precision`` / ``bcubed.recall``
-    on hard assignments. The library call is what gets reported; this form
-    is the shuffle null, which would otherwise be quadratic in pure Python.
+    on hard assignments. The library call is what gets reported.
     """
     speakers = np.asarray(speakers)
     clusters = np.asarray(clusters)
@@ -267,18 +303,6 @@ def bcubed_library(speakers, clusters):
     recall = float(bcubed.recall(cdict, ldict))
     f1 = float(bcubed.fscore(precision, recall))
     return precision, recall, f1
-
-
-def shuffled_bcubed(speakers, clusters, n_shuffles, seed):
-    rng = np.random.default_rng(int(seed))
-    speakers = np.asarray(speakers)
-    recall_acc = 0.0
-    f1_acc = 0.0
-    for _ in range(n_shuffles):
-        _precision, recall, f1 = bcubed_hard(rng.permutation(speakers), clusters)
-        recall_acc += recall
-        f1_acc += f1
-    return recall_acc / n_shuffles, f1_acc / n_shuffles
 
 
 def fit_kmeans(features, n_clusters, km):
@@ -330,26 +354,27 @@ def _fmt(value):
     return f"{float(value):.3f}"
 
 
-def embed_rows(codec, proj, rows, sample_rate, device):
+def embed_rows(table, rows):
+    vocab = int(table.shape[0])
     vectors = []
     for row in tqdm(rows, desc="embed", dynamic_ncols=True):
-        wav = load_mono(row["path"], sample_rate)
-        try:
-            emb, _codes, _toks = embed_waveform(codec, proj, wav, device)
-            vec = average_embedding(emb).detach().float().cpu().numpy()
-        except RuntimeError as exc:
-            raise SystemExit(f"{row['path']}: {exc}") from exc
-        row["n_frames"] = int(emb.shape[0])
-        row["seconds"] = float(wav.shape[-1]) / sample_rate
-        vectors.append(np.asarray(vec, dtype=np.float64))
-    return np.stack(vectors)
+        ids = read_tokens(row["path"], vocab)
+        frames = table[ids].astype(np.float64, copy=False)
+        row["n_frames"] = int(frames.shape[0])
+        if row["seconds"] is None:
+            row["seconds"] = row["n_frames"] / FRAME_HZ
+        vectors.append(frames.mean(axis=0))
+    stacked = np.stack(vectors)
+    if not np.isfinite(stacked).all():
+        raise SystemExit("non-finite utterance embedding")
+    return stacked
 
 
-def run_metadata(path, rows, save_dir, codec, proj, sample_rate, device, cfg):
+def run_metadata(path, rows, save_dir, table, cfg):
     speakers = [row["speaker"] for row in rows]
     n_speakers = len(set(speakers))
     log.info("%s: %d utterances, %d speakers", path.name, len(rows), n_speakers)
-    embeddings = embed_rows(codec, proj, rows, sample_rate, device)
+    embeddings = embed_rows(table, rows)
     features = prepare_features(embeddings, cfg["kmeans"]["normalize"])
     clusters = fit_kmeans(features, n_speakers, cfg["kmeans"])
     library = bcubed_library(speakers, clusters)
@@ -359,9 +384,6 @@ def run_metadata(path, rows, save_dir, codec, proj, sample_rate, device, cfg):
             f"B-cubed mismatch on {path.name}: library {library} vs closed form {fast}"
         )
     precision, recall, f1 = library
-    recall_shuf, f1_shuf = shuffled_bcubed(
-        speakers, clusters, N_SHUFFLES, cfg["kmeans"]["random_state"],
-    )
     sil = silhouette(features, clusters, cfg["kmeans"]["silhouette_metric"])
     sizes = np.bincount(clusters)
     sizes = sizes[sizes > 0]
@@ -373,9 +395,6 @@ def run_metadata(path, rows, save_dir, codec, proj, sample_rate, device, cfg):
         "bcubed_precision": _round(precision),
         "bcubed_recall": _round(recall),
         "bcubed_f1": _round(f1),
-        "bcubed_recall_shuffled": _round(recall_shuf),
-        "bcubed_f1_shuffled": _round(f1_shuf),
-        "n_shuffles": N_SHUFFLES,
         "cluster_size_min": int(sizes.min()),
         "cluster_size_max": int(sizes.max()),
     }
@@ -389,55 +408,34 @@ def run_metadata(path, rows, save_dir, codec, proj, sample_rate, device, cfg):
     })
     assignments_path = save_dir / "assignments.csv"
     assignments.to_csv(assignments_path, index=False)
+    embed_dim = int(table.shape[1])
     summary = {
-        "checkpoint": cfg["checkpoint"],
-        "representation": "mean of decompressor.in_proj",
+        "embeddings": cfg["embeddings"],
+        "representation": "mean of embedding-table rows",
         "representation_detail": (
-            "Each frame is a 13-D binary-spherical code lifted by "
-            "Linear(13, 256) on its own. Focal blocks are not used. "
-            "The utterance vector is the mean of those 256-D frames."
+            "Each frame is the row of the embedding table selected by its "
+            "token id. The utterance vector is the mean of those rows."
         ),
-        "embed_dim": EMBED_DIM,
+        "embed_dim": embed_dim,
         "metadata": str(path),
         "normalize": bool(cfg["kmeans"]["normalize"]),
         "kmeans": cfg["kmeans"],
         **metrics,
-        "reading": (
-            "Across {n} utterances and {k} speakers, silhouette is {sil}. "
-            "B-cubed precision is {precision}, recall is {recall}, and F1 is {f1}, "
-            "against a speaker-shuffle recall of {recall_shuf} and F1 of {f1_shuf}. "
-            "A silhouette near 1 and a B-cubed F1 well above the shuffle mean the "
-            "averaged 256-D vector separates these speakers. A silhouette near 0 and "
-            "an F1 near the shuffle mean the average does not carry speaker identity."
-        ).format(
-            n=metrics["n_utterances"],
-            k=metrics["n_speakers"],
-            sil=_fmt(metrics["silhouette"]),
-            precision=_fmt(metrics["bcubed_precision"]),
-            recall=_fmt(metrics["bcubed_recall"]),
-            f1=_fmt(metrics["bcubed_f1"]),
-            recall_shuf=_fmt(metrics["bcubed_recall_shuffled"]),
-            f1_shuf=_fmt(metrics["bcubed_f1_shuffled"]),
-        ),
     }
     summary_path = save_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print()
     print(
         f"{path.name}  ·  {metrics['n_utterances']} utterances  ·  "
-        f"{metrics['n_speakers']} speakers  ·  mean of {EMBED_DIM}-D frames"
+        f"{metrics['n_speakers']} speakers  ·  mean of {embed_dim}-D frames"
     )
     for label, key in (
         ("silhouette", "silhouette"),
         ("B-cubed precision", "bcubed_precision"),
         ("B-cubed recall", "bcubed_recall"),
         ("B-cubed F1", "bcubed_f1"),
-        ("B-cubed recall, shuffled", "bcubed_recall_shuffled"),
-        ("B-cubed F1, shuffled", "bcubed_f1_shuffled"),
     ):
         print(f"  {label:<28} {_fmt(metrics[key])}")
-    print()
-    print(summary["reading"])
     print()
     print(f"wrote {assignments_path}")
     print(f"wrote {summary_path}")
@@ -448,48 +446,24 @@ def main():
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     cfg, config_path = load_cluster_config(args.cluster_config)
+    metadata_path = Path(args.metadata).expanduser().resolve()
+    rows = load_rows(metadata_path, args.limit)
+    table = load_embedding_table(args.embeddings)
     cfg = {
-        "checkpoint": args.checkpoint,
+        "embeddings": str(Path(args.embeddings).expanduser().resolve()),
         "kmeans": cfg["kmeans"],
     }
-    files, is_dir = metadata_files(args.metadata_dir)
-    loaded = []
-    for path in files:
-        rows = load_rows(path, args.limit)
-        if rows is None:
-            if is_dir:
-                log.info("skip %s: no path and speaker columns", path.name)
-                continue
-            raise SystemExit(
-                f"{path} needs a path column {list(PATH_COLUMNS)} and a speaker column"
-            )
-        loaded.append((path, rows))
-    if not loaded:
-        raise SystemExit(
-            f"no metadata with columns {list(PATH_COLUMNS)} and {list(SPEAKER_COLUMNS)}"
-        )
-
-    save_root = (
-        Path(args.save_dir).expanduser().resolve()
-        if args.save_dir
-        else Path.cwd() / "speaker-clustering"
-    )
-    multiple = len(loaded) > 1
+    save_dir = Path(args.result_dir).expanduser().resolve()
     log.info("cluster config %s", config_path)
     log.info(
-        "%d metadata file(s), normalize=%s, silhouette metric=%s",
-        len(loaded), cfg["kmeans"]["normalize"], cfg["kmeans"]["silhouette_metric"],
+        "normalize=%s, silhouette metric=%s",
+        cfg["kmeans"]["normalize"], cfg["kmeans"]["silhouette_metric"],
     )
-
-    device = torch.device(args.device)
-    codec, proj, _hop, sample_rate = load_codec(args.checkpoint, device)
     log.info(
-        "checkpoint %s on %s · embedding Linear(%d, %d) · mean over frames",
-        args.checkpoint, device, proj.in_features, proj.out_features,
+        "embeddings %s · %d ids · %d-D",
+        cfg["embeddings"], table.shape[0], table.shape[1],
     )
-    for path, rows in loaded:
-        out = save_root / path.stem if multiple else save_root
-        run_metadata(path, rows, out, codec, proj, sample_rate, device, cfg)
+    run_metadata(metadata_path, rows, save_dir, table, cfg)
 
 
 if __name__ == "__main__":
